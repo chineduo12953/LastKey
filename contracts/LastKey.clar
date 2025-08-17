@@ -18,6 +18,23 @@
 (define-constant ERR_INVALID_VERSION (err u107))
 (define-constant ERR_VERSION_LIMIT_EXCEEDED (err u108))
 (define-constant ERR_SAME_VERSION (err u109))
+(define-constant ERR_BENEFICIARY_NOT_FOUND (err u110))
+(define-constant ERR_BENEFICIARY_ALREADY_EXISTS (err u111))
+(define-constant ERR_INVALID_WEIGHT (err u112))
+(define-constant ERR_MAX_BENEFICIARIES_EXCEEDED (err u113))
+(define-constant ERR_INSUFFICIENT_ACCESS_LEVEL (err u114))
+(define-constant ERR_RECOVERY_NOT_ENABLED (err u115))
+(define-constant ERR_ALREADY_GUARDIAN (err u116))
+(define-constant ERR_NOT_GUARDIAN (err u117))
+(define-constant ERR_MAX_GUARDIANS_EXCEEDED (err u118))
+(define-constant ERR_THRESHOLD_TOO_HIGH (err u119))
+(define-constant ERR_THRESHOLD_TOO_LOW (err u120))
+(define-constant ERR_RECOVERY_ALREADY_ACTIVE (err u121))
+(define-constant ERR_NO_ACTIVE_RECOVERY (err u122))
+(define-constant ERR_ALREADY_SIGNED (err u123))
+(define-constant ERR_INSUFFICIENT_SIGNATURES (err u124))
+(define-constant ERR_RECOVERY_EXPIRED (err u125))
+(define-constant ERR_CANNOT_REMOVE_SELF (err u126))
 
 (define-map switches
   { owner: principal }
@@ -42,6 +59,8 @@
 
 (define-data-var total-switches uint u0)
 (define-data-var max-versions-per-switch uint u50)
+(define-data-var max-guardians-per-switch uint u10)
+(define-data-var recovery-period uint u604800)
 
 (define-map document-versions
   { owner: principal, version: uint }
@@ -60,6 +79,54 @@
     current-version: uint,
     total-versions: uint,
     active-version: uint
+  }
+)
+
+(define-map recovery-settings
+  { owner: principal }
+  {
+    is-enabled: bool,
+    threshold: uint,
+    guardian-count: uint
+  }
+)
+
+(define-map guardians
+  { owner: principal, guardian: principal }
+  {
+    is-active: bool,
+    added-at: uint,
+    added-by: principal
+  }
+)
+
+(define-map recovery-proposals
+  { owner: principal, proposal-id: uint }
+  {
+    initiated-by: principal,
+    initiated-at: uint,
+    expires-at: uint,
+    action-type: (string-ascii 32),
+    new-beneficiary: (optional principal),
+    new-document-hash: (optional (string-ascii 64)),
+    new-inactivity-period: (optional uint),
+    signature-count: uint,
+    is-executed: bool
+  }
+)
+
+(define-map recovery-signatures
+  { owner: principal, proposal-id: uint, guardian: principal }
+  {
+    signed-at: uint
+  }
+)
+
+(define-map recovery-metadata
+  { owner: principal }
+  {
+    current-proposal-id: uint,
+    total-proposals: uint
   }
 )
 
@@ -144,6 +211,34 @@
   (match (map-get? document-versions { owner: owner, version: version })
     version-data
     (get is-active version-data)
+    false
+  )
+)
+
+(define-read-only (get-recovery-settings (owner principal))
+  (map-get? recovery-settings { owner: owner })
+)
+
+(define-read-only (get-guardian (owner principal) (guardian principal))
+  (map-get? guardians { owner: owner, guardian: guardian })
+)
+
+(define-read-only (get-recovery-proposal (owner principal) (proposal-id uint))
+  (map-get? recovery-proposals { owner: owner, proposal-id: proposal-id })
+)
+
+(define-read-only (get-recovery-signature (owner principal) (proposal-id uint) (guardian principal))
+  (map-get? recovery-signatures { owner: owner, proposal-id: proposal-id, guardian: guardian })
+)
+
+(define-read-only (get-recovery-metadata (owner principal))
+  (map-get? recovery-metadata { owner: owner })
+)
+
+(define-read-only (is-guardian (owner principal) (guardian principal))
+  (match (map-get? guardians { owner: owner, guardian: guardian })
+    guardian-data
+    (get is-active guardian-data)
     false
   )
 )
@@ -491,3 +586,281 @@
     ERR_NOT_FOUND
   )
 )
+
+(define-public (enable-recovery (threshold uint))
+  (match (map-get? switches { owner: tx-sender })
+    switch-data
+    (begin
+      (asserts! (not (get is-released switch-data)) ERR_ALREADY_RELEASED)
+      (asserts! (> threshold u0) ERR_THRESHOLD_TOO_LOW)
+      (asserts! (<= threshold (var-get max-guardians-per-switch)) ERR_THRESHOLD_TOO_HIGH)
+      (match (map-get? recovery-settings { owner: tx-sender })
+        existing-settings
+        ERR_RECOVERY_ALREADY_ACTIVE
+        (begin
+          (map-set recovery-settings
+            { owner: tx-sender }
+            {
+              is-enabled: true,
+              threshold: threshold,
+              guardian-count: u0
+            }
+          )
+          (map-set recovery-metadata
+            { owner: tx-sender }
+            {
+              current-proposal-id: u0,
+              total-proposals: u0
+            }
+          )
+          (ok true)
+        )
+      )
+    )
+    ERR_NOT_FOUND
+  )
+)
+
+(define-public (disable-recovery)
+  (match (map-get? switches { owner: tx-sender })
+    switch-data
+    (begin
+      (asserts! (not (get is-released switch-data)) ERR_ALREADY_RELEASED)
+      (match (map-get? recovery-settings { owner: tx-sender })
+        settings
+        (begin
+          (map-delete recovery-settings { owner: tx-sender })
+          (map-delete recovery-metadata { owner: tx-sender })
+          (ok true)
+        )
+        ERR_RECOVERY_NOT_ENABLED
+      )
+    )
+    ERR_NOT_FOUND
+  )
+)
+
+(define-public (add-guardian (guardian principal))
+  (let
+    (
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (match (map-get? switches { owner: tx-sender })
+      switch-data
+      (begin
+        (asserts! (not (get is-released switch-data)) ERR_ALREADY_RELEASED)
+        (asserts! (not (is-eq guardian tx-sender)) ERR_CANNOT_REMOVE_SELF)
+        (match (map-get? recovery-settings { owner: tx-sender })
+          settings
+          (begin
+            (asserts! (get is-enabled settings) ERR_RECOVERY_NOT_ENABLED)
+            (asserts! (< (get guardian-count settings) (var-get max-guardians-per-switch)) ERR_MAX_GUARDIANS_EXCEEDED)
+            (match (map-get? guardians { owner: tx-sender, guardian: guardian })
+              existing-guardian
+              ERR_ALREADY_GUARDIAN
+              (begin
+                (map-set guardians
+                  { owner: tx-sender, guardian: guardian }
+                  {
+                    is-active: true,
+                    added-at: current-time,
+                    added-by: tx-sender
+                  }
+                )
+                (map-set recovery-settings
+                  { owner: tx-sender }
+                  (merge settings { guardian-count: (+ (get guardian-count settings) u1) })
+                )
+                (ok true)
+              )
+            )
+          )
+          ERR_RECOVERY_NOT_ENABLED
+        )
+      )
+      ERR_NOT_FOUND
+    )
+  )
+)
+
+(define-public (remove-guardian (guardian principal))
+  (match (map-get? switches { owner: tx-sender })
+    switch-data
+    (begin
+      (asserts! (not (get is-released switch-data)) ERR_ALREADY_RELEASED)
+      (match (map-get? recovery-settings { owner: tx-sender })
+        settings
+        (begin
+          (asserts! (get is-enabled settings) ERR_RECOVERY_NOT_ENABLED)
+          (match (map-get? guardians { owner: tx-sender, guardian: guardian })
+            guardian-data
+            (begin
+              (asserts! (get is-active guardian-data) ERR_NOT_GUARDIAN)
+              (map-delete guardians { owner: tx-sender, guardian: guardian })
+              (map-set recovery-settings
+                { owner: tx-sender }
+                (merge settings { guardian-count: (- (get guardian-count settings) u1) })
+              )
+              (ok true)
+            )
+            ERR_NOT_GUARDIAN
+          )
+        )
+        ERR_RECOVERY_NOT_ENABLED
+      )
+    )
+    ERR_NOT_FOUND
+  )
+)
+
+(define-public (initiate-recovery (owner principal) (action-type (string-ascii 32)) (new-beneficiary (optional principal)) (new-document-hash (optional (string-ascii 64))) (new-inactivity-period (optional uint)))
+  (let
+    (
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (match (map-get? switches { owner: owner })
+      switch-data
+      (begin
+        (asserts! (not (get is-released switch-data)) ERR_ALREADY_RELEASED)
+        (match (map-get? recovery-settings { owner: owner })
+          settings
+          (begin
+            (asserts! (get is-enabled settings) ERR_RECOVERY_NOT_ENABLED)
+            (asserts! (is-guardian owner tx-sender) ERR_NOT_GUARDIAN)
+            (match (map-get? recovery-metadata { owner: owner })
+              metadata
+              (let
+                (
+                  (next-proposal-id (+ (get current-proposal-id metadata) u1))
+                  (expires-at (+ current-time (var-get recovery-period)))
+                )
+                (map-set recovery-metadata
+                  { owner: owner }
+                  (merge metadata { 
+                    current-proposal-id: next-proposal-id,
+                    total-proposals: (+ (get total-proposals metadata) u1)
+                  })
+                )
+                (map-set recovery-proposals
+                  { owner: owner, proposal-id: next-proposal-id }
+                  {
+                    initiated-by: tx-sender,
+                    initiated-at: current-time,
+                    expires-at: expires-at,
+                    action-type: action-type,
+                    new-beneficiary: new-beneficiary,
+                    new-document-hash: new-document-hash,
+                    new-inactivity-period: new-inactivity-period,
+                    signature-count: u1,
+                    is-executed: false
+                  }
+                )
+                (map-set recovery-signatures
+                  { owner: owner, proposal-id: next-proposal-id, guardian: tx-sender }
+                  {
+                    signed-at: current-time
+                  }
+                )
+                (ok next-proposal-id)
+              )
+              ERR_NOT_FOUND
+            )
+          )
+          ERR_RECOVERY_NOT_ENABLED
+        )
+      )
+      ERR_NOT_FOUND
+    )
+  )
+)
+
+(define-public (sign-recovery (owner principal) (proposal-id uint))
+  (let
+    (
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (match (map-get? recovery-proposals { owner: owner, proposal-id: proposal-id })
+      proposal
+      (begin
+        (asserts! (not (get is-executed proposal)) ERR_ALREADY_SIGNED)
+        (asserts! (< current-time (get expires-at proposal)) ERR_RECOVERY_EXPIRED)
+        (asserts! (is-guardian owner tx-sender) ERR_NOT_GUARDIAN)
+        (match (map-get? recovery-signatures { owner: owner, proposal-id: proposal-id, guardian: tx-sender })
+          existing-signature
+          ERR_ALREADY_SIGNED
+          (begin
+            (map-set recovery-signatures
+              { owner: owner, proposal-id: proposal-id, guardian: tx-sender }
+              {
+                signed-at: current-time
+              }
+            )
+            (map-set recovery-proposals
+              { owner: owner, proposal-id: proposal-id }
+              (merge proposal { signature-count: (+ (get signature-count proposal) u1) })
+            )
+            (ok true)
+          )
+        )
+      )
+      ERR_NO_ACTIVE_RECOVERY
+    )
+  )
+)
+
+(define-public (execute-recovery (owner principal) (proposal-id uint))
+  (let
+    (
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (match (map-get? recovery-proposals { owner: owner, proposal-id: proposal-id })
+      proposal
+      (begin
+        (asserts! (not (get is-executed proposal)) ERR_ALREADY_SIGNED)
+        (asserts! (< current-time (get expires-at proposal)) ERR_RECOVERY_EXPIRED)
+        (match (map-get? recovery-settings { owner: owner })
+          settings
+          (begin
+            (asserts! (>= (get signature-count proposal) (get threshold settings)) ERR_INSUFFICIENT_SIGNATURES)
+            (match (map-get? switches { owner: owner })
+              switch-data
+              (let
+                (
+                  (action (get action-type proposal))
+                  (updated-switch
+                    (if (is-eq action "update-beneficiary")
+                      (merge switch-data { beneficiary: (unwrap-panic (get new-beneficiary proposal)) })
+                      (if (is-eq action "update-document")
+                        (merge switch-data { document-hash: (unwrap-panic (get new-document-hash proposal)) })
+                        (if (is-eq action "update-period")
+                          (merge switch-data { inactivity-period: (unwrap-panic (get new-inactivity-period proposal)) })
+                          switch-data
+                        )
+                      )
+                    )
+                  )
+                )
+                (map-set switches
+                  { owner: owner }
+                  updated-switch
+                )
+                (map-set recovery-proposals
+                  { owner: owner, proposal-id: proposal-id }
+                  (merge proposal { is-executed: true })
+                )
+                (ok true)
+              )
+              ERR_NOT_FOUND
+            )
+          )
+          ERR_RECOVERY_NOT_ENABLED
+        )
+      )
+      ERR_NO_ACTIVE_RECOVERY
+    )
+  )
+)
+
+
+
+
